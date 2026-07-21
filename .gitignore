@@ -1,0 +1,7 @@
+node_modules/
+.pnpm-store/
+.next/
+.env
+.DS_Store
+*.log
+db-backups/*

@@ -161,6 +161,74 @@ a {
   color: var(--ink);
 }
 
+.sourcePicker {
+  display: grid;
+  gap: 8px;
+  max-block-size: 330px;
+  margin-block-start: 14px;
+  overflow: auto;
+  padding: 2px;
+}
+
+.sourcePickerHeader,
+.sourceOption {
+  display: flex;
+  align-items: center;
+}
+
+.sourcePickerHeader {
+  justify-content: space-between;
+  color: var(--muted);
+  font-size: 0.78rem;
+  font-weight: 850;
+  text-transform: uppercase;
+}
+
+.sourcePickerHeader strong {
+  color: var(--ink);
+}
+
+.sourceOption {
+  inline-size: 100%;
+  gap: 9px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 10px;
+  background: var(--surface-soft);
+  color: var(--muted);
+  text-align: left;
+}
+
+.sourceOption:hover,
+.sourceOption.selected {
+  border-color: rgba(15, 127, 58, 0.35);
+  background: #edf8f1;
+  color: var(--green-dark);
+}
+
+.sourceOption span {
+  display: grid;
+  min-inline-size: 0;
+}
+
+.sourceOption b,
+.sourceOption small {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.sourceOption b {
+  color: var(--ink);
+}
+
+.sourceEmpty {
+  margin: 0;
+  color: var(--muted);
+  font-size: 0.9rem;
+  line-height: 1.45;
+}
+
 .heroBand {
   display: grid;
   grid-template-columns: minmax(0, 1fr) auto;
@@ -334,6 +402,15 @@ h3 {
   justify-content: space-between;
   gap: 18px;
   margin-block-end: 18px;
+}
+
+.sourceMeta {
+  display: block;
+  margin-block-start: 5px;
+  color: var(--muted);
+  font-size: 0.9rem;
+  font-weight: 700;
+  text-transform: capitalize;
 }
 
 .searchBox {

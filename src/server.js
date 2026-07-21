@@ -11,21 +11,26 @@ import {
 import {
   createBackupRun,
   decryptUserTokens,
+  getLibrarySourceForUser,
   ensureSpotifyLibrarySourceForUser,
   finishBackupRun,
   getLibrarySummary,
+  listLibrarySources,
   getPublicUserById,
   getUserById,
   listTracks,
   migrate,
   recordLibraryEventsForRun,
   updateUserTokens,
+  upsertSpotifyPlaylistSourcesForUser,
   upsertSavedTracks,
   upsertUserFromSpotify,
 } from "./db.js";
 import {
   createAuthorizationUrl,
   exchangeCodeForToken,
+  fetchCurrentUserPlaylists,
+  fetchPlaylistTracks,
   fetchSavedTracks,
   getCurrentSpotifyUser,
   refreshAccessToken,
@@ -61,6 +66,19 @@ function redirect(res, location) {
 
 function sendError(res, status, message) {
   sendJson(res, status, { error: message });
+}
+
+function parseOptionalId(value) {
+  if (!value) return null;
+
+  const id = Number(value);
+  if (!Number.isInteger(id) || id <= 0) {
+    const error = new Error("Invalid source id.");
+    error.status = 400;
+    throw error;
+  }
+
+  return id;
 }
 
 async function getSessionUser(req) {
@@ -104,6 +122,7 @@ const server = createServer(async (req, res) => {
       if (!userId) {
         return sendJson(res, 200, {
           tracks: [],
+          sources: [],
           total: 0,
           lastBackupAt: null,
           lastBackupStatus: null,
@@ -111,16 +130,22 @@ const server = createServer(async (req, res) => {
       }
 
       await ensureDatabaseReady();
+      const sourceId = parseOptionalId(requestUrl.searchParams.get("sourceId"));
       const [tracks, summary] = await Promise.all([
-        listTracks(userId),
-        getLibrarySummary(userId),
+        listTracks(userId, sourceId),
+        getLibrarySummary(userId, sourceId),
       ]);
 
       return sendJson(res, 200, { tracks, ...summary });
     }
 
-    if (requestUrl.pathname === "/api/backup/liked-songs" && req.method === "POST") {
-      return backupLikedSongs(req, res);
+    if (requestUrl.pathname === "/api/library-sources") {
+      return librarySources(req, res);
+    }
+
+    if (requestUrl.pathname === "/api/backup/source" && req.method === "POST") {
+      const sourceId = parseOptionalId(requestUrl.searchParams.get("sourceId"));
+      return backupLibrarySource(req, res, sourceId);
     }
 
     if (requestUrl.pathname === "/auth/login") {
@@ -181,6 +206,13 @@ async function authCallback(req, res, requestUrl) {
   const profile = await getCurrentSpotifyUser(tokenSet.access_token);
   await ensureDatabaseReady();
   const user = await upsertUserFromSpotify(profile, tokenSet);
+  const dbUser = await getUserById(user.id);
+  try {
+    const playlists = await fetchCurrentUserPlaylists(tokenSet.access_token);
+    await upsertSpotifyPlaylistSourcesForUser(dbUser, playlists);
+  } catch (error) {
+    console.warn(`Spotify playlist discovery failed after login: ${error.message}`);
+  }
   setSignedCookie(res, "spotify_backup_session", String(user.id), {
     maxAge: 60 * 60 * 24 * 30,
   });
@@ -188,31 +220,68 @@ async function authCallback(req, res, requestUrl) {
   return redirect(res, "/?connected=1");
 }
 
-async function backupLikedSongs(req, res) {
+async function librarySources(req, res) {
   const user = await getSessionUser(req);
-  if (!user) return sendError(res, 401, "Connect Spotify before backing up songs.");
+  if (!user) return sendJson(res, 200, { sources: [] });
+
+  let discoveryError = null;
+  try {
+    const accessToken = await getValidAccessToken(user);
+    await refreshSpotifyLibrarySources(user, accessToken);
+  } catch (error) {
+    discoveryError = error.message;
+  }
+
+  const sources = await listLibrarySources(Number(user.id));
+  return sendJson(res, 200, { sources, discoveryError });
+}
+
+async function refreshSpotifyLibrarySources(user, accessToken) {
+  await ensureSpotifyLibrarySourceForUser(user);
+  const playlists = await fetchCurrentUserPlaylists(accessToken);
+  await upsertSpotifyPlaylistSourcesForUser(user, playlists);
+}
+
+async function backupLibrarySource(req, res, librarySourceId) {
+  const user = await getSessionUser(req);
+  if (!user) return sendError(res, 401, "Connect a music provider before backing up songs.");
+
+  const source = await getLibrarySourceForUser(Number(user.id), librarySourceId);
+  if (!source) return sendError(res, 404, "Music source was not found.");
+  if (source.provider !== "spotify") {
+    return sendError(res, 400, `Backup is not implemented for ${source.provider}.`);
+  }
+  if (source.sourceType !== "liked_songs" && source.sourceType !== "playlist") {
+    return sendError(res, 400, `Backup is not implemented for ${source.sourceType}.`);
+  }
 
   const accessToken = await getValidAccessToken(user);
-  const source = await ensureSpotifyLibrarySourceForUser(user);
   const backupRunId = await createBackupRun(Number(user.id), source);
   let totalSeen = 0;
 
   try {
-    totalSeen = await fetchSavedTracks(accessToken, async (items, _page, pageStart) => {
+    const onPage = async (items, _page, pageStart) => {
       await upsertSavedTracks(Number(user.id), items, {
         backupRunId,
         provider: source.provider,
         startPosition: pageStart,
       });
-    });
+    };
+
+    if (source.sourceType === "liked_songs") {
+      totalSeen = await fetchSavedTracks(accessToken, onPage);
+    } else {
+      totalSeen = await fetchPlaylistTracks(accessToken, source.providerSourceId, onPage);
+    }
 
     await recordLibraryEventsForRun(backupRunId, source.librarySourceId);
     await finishBackupRun(backupRunId, "succeeded", totalSeen);
-    const [tracks, summary] = await Promise.all([
-      listTracks(Number(user.id)),
-      getLibrarySummary(Number(user.id)),
+    const [tracks, summary, sources] = await Promise.all([
+      listTracks(Number(user.id), source.librarySourceId),
+      getLibrarySummary(Number(user.id), source.librarySourceId),
+      listLibrarySources(Number(user.id)),
     ]);
-    return sendJson(res, 200, { tracks, ...summary });
+    return sendJson(res, 200, { tracks, sources, ...summary });
   } catch (error) {
     await finishBackupRun(backupRunId, "failed", totalSeen, error.message);
     throw error;

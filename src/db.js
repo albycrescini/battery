@@ -7,6 +7,7 @@ const { Pool } = pg;
 const spotifyProvider = "spotify";
 const likedSongsSourceType = "liked_songs";
 const likedSongsSourceId = "library";
+const playlistSourceType = "playlist";
 
 let pool;
 
@@ -109,27 +110,7 @@ export async function migrate() {
       UNIQUE (provider, external_track_id)
     );
 
-    CREATE TABLE IF NOT EXISTS tracks (
-      id BIGSERIAL PRIMARY KEY,
-      user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-      spotify_track_id TEXT NOT NULL,
-      name TEXT NOT NULL,
-      artists TEXT NOT NULL,
-      album_name TEXT,
-      duration_ms INTEGER,
-      popularity INTEGER,
-      explicit BOOLEAN,
-      preview_url TEXT,
-      external_url TEXT,
-      spotify_uri TEXT,
-      image_url TEXT,
-      isrc TEXT,
-      spotify_added_at TIMESTAMPTZ,
-      first_backed_up_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-      last_seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-      raw JSONB NOT NULL,
-      UNIQUE (user_id, spotify_track_id)
-    );
+    DROP TABLE IF EXISTS tracks;
 
     CREATE TABLE IF NOT EXISTS backup_runs (
       id BIGSERIAL PRIMARY KEY,
@@ -138,11 +119,12 @@ export async function migrate() {
       library_source_id BIGINT REFERENCES library_sources(id) ON DELETE SET NULL,
       provider TEXT,
       source_type TEXT,
-      source TEXT NOT NULL DEFAULT 'spotify-liked-songs',
+      source TEXT NOT NULL DEFAULT 'spotify:liked_songs',
       status TEXT NOT NULL,
       started_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
       finished_at TIMESTAMPTZ,
       tracks_seen INTEGER NOT NULL DEFAULT 0,
+      snapshot_key TEXT,
       error_message TEXT
     );
 
@@ -154,15 +136,37 @@ export async function migrate() {
       ADD COLUMN IF NOT EXISTS provider TEXT;
     ALTER TABLE backup_runs
       ADD COLUMN IF NOT EXISTS source_type TEXT;
+    ALTER TABLE backup_runs
+      ADD COLUMN IF NOT EXISTS snapshot_key TEXT;
+
+    DO $$
+    BEGIN
+      IF EXISTS (
+        SELECT 1
+        FROM information_schema.columns
+        WHERE table_name = 'backup_run_items'
+          AND column_name = 'backup_run_id'
+      )
+      AND NOT EXISTS (
+        SELECT 1
+        FROM information_schema.columns
+        WHERE table_name = 'backup_run_items'
+          AND column_name = 'id'
+      ) THEN
+        DROP TABLE IF EXISTS library_events;
+        DROP TABLE IF EXISTS backup_run_items;
+      END IF;
+    END $$;
 
     CREATE TABLE IF NOT EXISTS backup_run_items (
+      id BIGSERIAL PRIMARY KEY,
       backup_run_id BIGINT NOT NULL REFERENCES backup_runs(id) ON DELETE CASCADE,
       provider_track_id BIGINT NOT NULL REFERENCES provider_tracks(id) ON DELETE CASCADE,
       provider_added_at TIMESTAMPTZ,
-      position INTEGER,
+      position INTEGER NOT NULL DEFAULT 0,
       raw JSONB NOT NULL DEFAULT '{}'::jsonb,
       observed_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-      PRIMARY KEY (backup_run_id, provider_track_id)
+      UNIQUE (backup_run_id, provider_track_id, position)
     );
 
     CREATE TABLE IF NOT EXISTS library_events (
@@ -177,8 +181,6 @@ export async function migrate() {
       UNIQUE (library_source_id, provider_track_id, event_type, backup_run_id)
     );
 
-    CREATE INDEX IF NOT EXISTS idx_tracks_user_saved_at
-      ON tracks (user_id, spotify_added_at DESC NULLS LAST);
     CREATE INDEX IF NOT EXISTS idx_backup_runs_user_started_at
       ON backup_runs (user_id, started_at DESC);
     CREATE INDEX IF NOT EXISTS idx_provider_accounts_user_provider
@@ -189,6 +191,9 @@ export async function migrate() {
       ON provider_tracks (canonical_track_id);
     CREATE INDEX IF NOT EXISTS idx_backup_runs_source_started_at
       ON backup_runs (library_source_id, started_at DESC);
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_backup_runs_source_snapshot_key
+      ON backup_runs (library_source_id, snapshot_key)
+      WHERE snapshot_key IS NOT NULL;
     CREATE INDEX IF NOT EXISTS idx_backup_run_items_provider_track
       ON backup_run_items (provider_track_id);
     CREATE INDEX IF NOT EXISTS idx_library_events_source_track
@@ -402,6 +407,62 @@ async function getSpotifyProviderAccountId(client, userId) {
   return result.rows[0] ? Number(result.rows[0].id) : null;
 }
 
+async function ensureSpotifyProviderAccountForUser(client, user) {
+  let providerAccountId = await getSpotifyProviderAccountId(client, Number(user.id));
+
+  if (providerAccountId) return providerAccountId;
+
+  if (!user.spotify_user_id) {
+    throw new Error("Spotify account metadata is missing. Please reconnect Spotify.");
+  }
+
+  const result = await client.query(
+    `
+      INSERT INTO provider_accounts (
+        user_id,
+        provider,
+        provider_user_id,
+        display_name,
+        email,
+        country,
+        product,
+        image_url,
+        access_token,
+        refresh_token,
+        token_expires_at
+      )
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+      ON CONFLICT (provider, provider_user_id) DO UPDATE SET
+        user_id = EXCLUDED.user_id,
+        display_name = EXCLUDED.display_name,
+        email = EXCLUDED.email,
+        country = EXCLUDED.country,
+        product = EXCLUDED.product,
+        image_url = EXCLUDED.image_url,
+        access_token = COALESCE(EXCLUDED.access_token, provider_accounts.access_token),
+        refresh_token = COALESCE(EXCLUDED.refresh_token, provider_accounts.refresh_token),
+        token_expires_at = COALESCE(EXCLUDED.token_expires_at, provider_accounts.token_expires_at),
+        updated_at = NOW()
+      RETURNING id
+    `,
+    [
+      Number(user.id),
+      spotifyProvider,
+      user.spotify_user_id,
+      user.display_name || null,
+      user.email || null,
+      user.country || null,
+      user.product || null,
+      user.image_url || null,
+      user.access_token || null,
+      user.refresh_token || null,
+      user.token_expires_at || null,
+    ],
+  );
+
+  return Number(result.rows[0].id);
+}
+
 async function ensureLibrarySource(client, source) {
   const result = await client.query(
     `
@@ -454,62 +515,7 @@ export async function ensureSpotifyLibrarySourceForUser(user) {
   try {
     await client.query("BEGIN");
 
-    let providerAccountId = await getSpotifyProviderAccountId(client, Number(user.id));
-
-    if (!providerAccountId) {
-      if (!user.spotify_user_id) {
-        throw new Error("Spotify account metadata is missing. Please reconnect Spotify.");
-      }
-
-      const result = await client.query(
-        `
-          INSERT INTO provider_accounts (
-            user_id,
-            provider,
-            provider_user_id,
-            display_name,
-            email,
-            country,
-            product,
-            image_url,
-            access_token,
-            refresh_token,
-            token_expires_at
-          )
-          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
-          ON CONFLICT (provider, provider_user_id) DO UPDATE SET
-            user_id = EXCLUDED.user_id,
-            display_name = EXCLUDED.display_name,
-            email = EXCLUDED.email,
-            country = EXCLUDED.country,
-            product = EXCLUDED.product,
-            image_url = EXCLUDED.image_url,
-            access_token = COALESCE(EXCLUDED.access_token, provider_accounts.access_token),
-            refresh_token = COALESCE(EXCLUDED.refresh_token, provider_accounts.refresh_token),
-            token_expires_at = COALESCE(
-              EXCLUDED.token_expires_at,
-              provider_accounts.token_expires_at
-            ),
-            updated_at = NOW()
-          RETURNING id
-        `,
-        [
-          Number(user.id),
-          spotifyProvider,
-          user.spotify_user_id,
-          user.display_name || null,
-          user.email || null,
-          user.country || null,
-          user.product || null,
-          user.image_url || null,
-          user.access_token || null,
-          user.refresh_token || null,
-          user.token_expires_at || null,
-        ],
-      );
-      providerAccountId = Number(result.rows[0].id);
-    }
-
+    const providerAccountId = await ensureSpotifyProviderAccountForUser(client, user);
     const librarySourceId = await ensureLibrarySource(client, {
       providerAccountId,
       sourceType: likedSongsSourceType,
@@ -521,9 +527,11 @@ export async function ensureSpotifyLibrarySourceForUser(user) {
     return {
       provider: spotifyProvider,
       sourceType: likedSongsSourceType,
-      source: "spotify-liked-songs",
+      source: `${spotifyProvider}:${likedSongsSourceType}:${likedSongsSourceId}`,
       providerAccountId,
       librarySourceId,
+      providerSourceId: likedSongsSourceId,
+      name: "Liked Songs",
     };
   } catch (error) {
     await client.query("ROLLBACK");
@@ -531,6 +539,171 @@ export async function ensureSpotifyLibrarySourceForUser(user) {
   } finally {
     client.release();
   }
+}
+
+function toPublicLibrarySource(row) {
+  if (!row) return null;
+
+  const raw = row.raw || {};
+  return {
+    id: Number(row.id),
+    providerAccountId: Number(row.provider_account_id),
+    provider: row.provider,
+    providerUserId: row.provider_user_id,
+    sourceType: row.source_type,
+    providerSourceId: row.provider_source_id,
+    name: row.name,
+    ownerName: raw.owner?.display_name || raw.owner?.id || null,
+    imageUrl: raw.images?.[0]?.url || null,
+    trackTotal: raw.tracks?.total ?? null,
+    currentTotal: row.current_total ?? 0,
+    lastBackupAt: row.last_backup_at || null,
+    lastBackupStatus: row.last_backup_status || null,
+    lastBackupTracksSeen: row.last_backup_tracks_seen || 0,
+    lastBackupError: row.last_backup_error || null,
+  };
+}
+
+export async function upsertSpotifyPlaylistSourcesForUser(user, playlists) {
+  const client = await getPool().connect();
+
+  try {
+    await client.query("BEGIN");
+    const providerAccountId = await ensureSpotifyProviderAccountForUser(client, user);
+    const sources = [];
+
+    for (const playlist of playlists) {
+      if (!playlist?.id) continue;
+      const librarySourceId = await ensureLibrarySource(client, {
+        providerAccountId,
+        sourceType: playlistSourceType,
+        providerSourceId: playlist.id,
+        name: playlist.name || "Untitled playlist",
+        raw: playlist,
+      });
+      sources.push({
+        provider: spotifyProvider,
+        sourceType: playlistSourceType,
+        source: `${spotifyProvider}:${playlistSourceType}:${playlist.id}`,
+        providerAccountId,
+        librarySourceId,
+        providerSourceId: playlist.id,
+        name: playlist.name || "Untitled playlist",
+      });
+    }
+
+    await client.query("COMMIT");
+    return sources;
+  } catch (error) {
+    await client.query("ROLLBACK");
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
+export async function listLibrarySources(userId) {
+  const result = await getPool().query(
+    `
+      SELECT
+        library_sources.id,
+        library_sources.provider_account_id,
+        library_sources.source_type,
+        library_sources.provider_source_id,
+        library_sources.name,
+        library_sources.raw,
+        provider_accounts.provider,
+        provider_accounts.provider_user_id,
+        latest_run.finished_at AS last_backup_at,
+        latest_run.status AS last_backup_status,
+        latest_run.tracks_seen AS last_backup_tracks_seen,
+        latest_run.error_message AS last_backup_error,
+        COALESCE(latest_count.current_total, 0)::int AS current_total
+      FROM library_sources
+      INNER JOIN provider_accounts
+        ON provider_accounts.id = library_sources.provider_account_id
+      LEFT JOIN LATERAL (
+        SELECT id, finished_at, status, tracks_seen, error_message
+        FROM backup_runs
+        WHERE backup_runs.library_source_id = library_sources.id
+        ORDER BY started_at DESC, id DESC
+        LIMIT 1
+      ) latest_run ON TRUE
+      LEFT JOIN LATERAL (
+        SELECT id
+        FROM backup_runs
+        WHERE
+          backup_runs.library_source_id = library_sources.id
+          AND backup_runs.status = 'succeeded'
+        ORDER BY finished_at DESC NULLS LAST, started_at DESC, id DESC
+        LIMIT 1
+      ) latest_success ON TRUE
+      LEFT JOIN LATERAL (
+        SELECT COUNT(DISTINCT provider_track_id)::int AS current_total
+        FROM backup_run_items
+        WHERE backup_run_items.backup_run_id = latest_success.id
+      ) latest_count ON TRUE
+      WHERE provider_accounts.user_id = $1
+      ORDER BY
+        provider_accounts.provider ASC,
+        CASE library_sources.source_type
+          WHEN 'liked_songs' THEN 0
+          WHEN 'playlist' THEN 1
+          ELSE 2
+        END ASC,
+        lower(library_sources.name) ASC,
+        library_sources.id ASC
+    `,
+    [userId],
+  );
+
+  return result.rows.map(toPublicLibrarySource);
+}
+
+export async function getLibrarySourceForUser(userId, librarySourceId = null) {
+  const result = await getPool().query(
+    `
+      SELECT
+        library_sources.id,
+        library_sources.provider_account_id,
+        library_sources.source_type,
+        library_sources.provider_source_id,
+        library_sources.name,
+        library_sources.raw,
+        provider_accounts.provider,
+        provider_accounts.provider_user_id
+      FROM library_sources
+      INNER JOIN provider_accounts
+        ON provider_accounts.id = library_sources.provider_account_id
+      WHERE
+        provider_accounts.user_id = $1
+        AND ($2::bigint IS NULL OR library_sources.id = $2::bigint)
+      ORDER BY
+        CASE library_sources.source_type
+          WHEN 'liked_songs' THEN 0
+          WHEN 'playlist' THEN 1
+          ELSE 2
+        END ASC,
+        lower(library_sources.name) ASC,
+        library_sources.id ASC
+      LIMIT 1
+    `,
+    [userId, librarySourceId],
+  );
+
+  const source = result.rows[0];
+  if (!source) return null;
+
+  return {
+    provider: source.provider,
+    sourceType: source.source_type,
+    source: `${source.provider}:${source.source_type}:${source.provider_source_id}`,
+    providerAccountId: Number(source.provider_account_id),
+    librarySourceId: Number(source.id),
+    providerSourceId: source.provider_source_id,
+    name: source.name,
+    raw: source.raw || {},
+  };
 }
 
 export async function updateUserTokens(userId, tokenSet) {
@@ -578,6 +751,7 @@ export async function createBackupRun(userId, options = {}) {
   const provider = options.provider || spotifyProvider;
   const sourceType = options.sourceType || likedSongsSourceType;
   const source = options.source || `${provider}:${sourceType}`;
+  const startedAt = options.startedAt || new Date();
   const result = await getPool().query(
     `
       INSERT INTO backup_runs (
@@ -587,9 +761,11 @@ export async function createBackupRun(userId, options = {}) {
         provider,
         source_type,
         source,
-        status
+        snapshot_key,
+        status,
+        started_at
       )
-      VALUES ($1, $2, $3, $4, $5, $6, 'running')
+      VALUES ($1, $2, $3, $4, $5, $6, $7, 'running', $8)
       RETURNING id
     `,
     [
@@ -599,34 +775,68 @@ export async function createBackupRun(userId, options = {}) {
       provider,
       sourceType,
       source,
+      options.snapshotKey || null,
+      startedAt,
     ],
   );
   return Number(result.rows[0].id);
 }
 
-export async function finishBackupRun(runId, status, tracksSeen, errorMessage = null) {
+export async function finishBackupRun(runId, status, tracksSeen, errorMessage = null, options = {}) {
+  const finishedAt = options.finishedAt || new Date();
   await getPool().query(
     `
       UPDATE backup_runs
       SET status = $2,
           tracks_seen = $3,
           error_message = $4,
-          finished_at = NOW()
+          finished_at = $5
       WHERE id = $1
     `,
-    [runId, status, tracksSeen, errorMessage],
+    [runId, status, tracksSeen, errorMessage, finishedAt],
   );
+}
+
+export async function backupRunSnapshotExists(librarySourceId, snapshotKey) {
+  const result = await getPool().query(
+    `
+      SELECT id
+      FROM backup_runs
+      WHERE
+        library_source_id = $1
+        AND snapshot_key = $2
+        AND status = 'succeeded'
+      LIMIT 1
+    `,
+    [librarySourceId, snapshotKey],
+  );
+
+  return Boolean(result.rows[0]);
+}
+
+export async function deleteBackupRunBySnapshotKey(librarySourceId, snapshotKey) {
+  const result = await getPool().query(
+    `
+      DELETE FROM backup_runs
+      WHERE library_source_id = $1 AND snapshot_key = $2
+    `,
+    [librarySourceId, snapshotKey],
+  );
+
+  return result.rowCount;
 }
 
 function normalizeTrack(savedTrack) {
   const track = savedTrack.track;
+  if (!track?.id || (track.type && track.type !== "track")) return null;
+
   const image = track.album?.images?.[0]?.url || null;
   const artists = (track.artists || []).map((artist) => artist.name).join(", ");
+  const providerAddedAt = savedTrack.added_at ? new Date(savedTrack.added_at) : null;
 
   return {
     provider: spotifyProvider,
     externalTrackId: track.id,
-    spotifyTrackId: track.id,
     name: track.name,
     artists,
     albumName: track.album?.name || null,
@@ -635,10 +845,10 @@ function normalizeTrack(savedTrack) {
     explicit: track.explicit ?? null,
     previewUrl: track.preview_url || null,
     externalUrl: track.external_urls?.spotify || null,
-    spotifyUri: track.uri || null,
+    providerUri: track.uri || null,
     imageUrl: image,
     isrc: track.external_ids?.isrc || null,
-    spotifyAddedAt: savedTrack.added_at ? new Date(savedTrack.added_at) : null,
+    providerAddedAt,
     raw: savedTrack,
     providerRaw: track,
   };
@@ -755,7 +965,7 @@ async function upsertProviderTrack(client, provider, canonicalTrackId, track) {
       track.explicit,
       track.previewUrl,
       track.externalUrl,
-      track.spotifyUri,
+      track.providerUri,
       track.imageUrl,
       normalizeIsrc(track.isrc),
       track.providerRaw,
@@ -765,64 +975,7 @@ async function upsertProviderTrack(client, provider, canonicalTrackId, track) {
   return Number(result.rows[0].id);
 }
 
-async function upsertLegacySpotifyTrack(client, userId, track) {
-  await client.query(
-    `
-      INSERT INTO tracks (
-        user_id,
-        spotify_track_id,
-        name,
-        artists,
-        album_name,
-        duration_ms,
-        popularity,
-        explicit,
-        preview_url,
-        external_url,
-        spotify_uri,
-        image_url,
-        isrc,
-        spotify_added_at,
-        raw
-      )
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
-      ON CONFLICT (user_id, spotify_track_id) DO UPDATE SET
-        name = EXCLUDED.name,
-        artists = EXCLUDED.artists,
-        album_name = EXCLUDED.album_name,
-        duration_ms = EXCLUDED.duration_ms,
-        popularity = EXCLUDED.popularity,
-        explicit = EXCLUDED.explicit,
-        preview_url = EXCLUDED.preview_url,
-        external_url = EXCLUDED.external_url,
-        spotify_uri = EXCLUDED.spotify_uri,
-        image_url = EXCLUDED.image_url,
-        isrc = EXCLUDED.isrc,
-        spotify_added_at = EXCLUDED.spotify_added_at,
-        raw = EXCLUDED.raw,
-        last_seen_at = NOW()
-    `,
-    [
-      userId,
-      track.spotifyTrackId,
-      track.name,
-      track.artists,
-      track.albumName,
-      track.durationMs,
-      track.popularity,
-      track.explicit,
-      track.previewUrl,
-      track.externalUrl,
-      track.spotifyUri,
-      track.imageUrl,
-      track.isrc,
-      track.spotifyAddedAt,
-      track.raw,
-    ],
-  );
-}
-
-export async function upsertSavedTracks(userId, savedTracks, options = {}) {
+export async function upsertSavedTracks(_userId, savedTracks, options = {}) {
   if (!savedTracks.length) return 0;
 
   const provider = options.provider || spotifyProvider;
@@ -830,6 +983,10 @@ export async function upsertSavedTracks(userId, savedTracks, options = {}) {
     throw new Error(`Unsupported saved-track adapter: ${provider}`);
   }
 
+  const observedAt = options.observedAt || new Date();
+  const providerAddedAtOverride = Object.hasOwn(options, "providerAddedAt")
+    ? options.providerAddedAt
+    : undefined;
   const client = await getPool().connect();
   let saved = 0;
 
@@ -837,11 +994,11 @@ export async function upsertSavedTracks(userId, savedTracks, options = {}) {
     await client.query("BEGIN");
 
     for (const [index, item] of savedTracks.entries()) {
-      if (!item.track?.id) continue;
       const track = normalizeTrack(item);
+      if (!track) continue;
       const position = options.startPosition !== undefined ? options.startPosition + index : null;
-
-      await upsertLegacySpotifyTrack(client, userId, track);
+      const providerAddedAt =
+        providerAddedAtOverride === undefined ? track.providerAddedAt : providerAddedAtOverride;
 
       if (options.backupRunId) {
         const canonicalTrackId = await upsertCanonicalTrack(client, track);
@@ -859,16 +1016,16 @@ export async function upsertSavedTracks(userId, savedTracks, options = {}) {
               provider_track_id,
               provider_added_at,
               position,
-              raw
+              raw,
+              observed_at
             )
-            VALUES ($1, $2, $3, $4, $5)
-            ON CONFLICT (backup_run_id, provider_track_id) DO UPDATE SET
+            VALUES ($1, $2, $3, $4, $5, $6)
+            ON CONFLICT (backup_run_id, provider_track_id, position) DO UPDATE SET
               provider_added_at = EXCLUDED.provider_added_at,
-              position = EXCLUDED.position,
               raw = EXCLUDED.raw,
-              observed_at = NOW()
+              observed_at = EXCLUDED.observed_at
           `,
-          [options.backupRunId, providerTrackId, track.spotifyAddedAt, position, track.raw],
+          [options.backupRunId, providerTrackId, providerAddedAt, position ?? index, track.raw, observedAt],
         );
       }
       saved += 1;
@@ -884,12 +1041,26 @@ export async function upsertSavedTracks(userId, savedTracks, options = {}) {
   }
 }
 
-export async function recordLibraryEventsForRun(backupRunId, librarySourceId) {
+export async function recordLibraryEventsForRun(backupRunId, librarySourceId, options = {}) {
   const client = await getPool().connect();
 
   try {
     await client.query("BEGIN");
 
+    const currentRun = await client.query(
+      `
+        SELECT COALESCE(finished_at, started_at) AS sort_at
+        FROM backup_runs
+        WHERE id = $1 AND library_source_id = $2
+      `,
+      [backupRunId, librarySourceId],
+    );
+    if (!currentRun.rows[0]) {
+      throw new Error("Backup run was not found for this source.");
+    }
+
+    const currentSortAt = currentRun.rows[0].sort_at || new Date();
+    const observedAt = options.observedAt || currentSortAt;
     const previousRun = await client.query(
       `
         SELECT id
@@ -898,10 +1069,11 @@ export async function recordLibraryEventsForRun(backupRunId, librarySourceId) {
           library_source_id = $1
           AND status = 'succeeded'
           AND id <> $2
-        ORDER BY finished_at DESC NULLS LAST, started_at DESC, id DESC
+          AND (COALESCE(finished_at, started_at), id) < ($3::timestamptz, $2::bigint)
+        ORDER BY COALESCE(finished_at, started_at) DESC, id DESC
         LIMIT 1
       `,
-      [librarySourceId, backupRunId],
+      [librarySourceId, backupRunId, currentSortAt],
     );
     const previousRunId = previousRun.rows[0] ? Number(previousRun.rows[0].id) : null;
 
@@ -915,14 +1087,21 @@ export async function recordLibraryEventsForRun(backupRunId, librarySourceId) {
             provider_event_at,
             backup_run_id
           )
-          SELECT $1, current_items.provider_track_id, 'added', NOW(),
+          SELECT $1, current_items.provider_track_id, 'added', $4,
                  current_items.provider_added_at, $2
-          FROM backup_run_items current_items
-          LEFT JOIN backup_run_items previous_items
-            ON previous_items.backup_run_id = $3
-           AND previous_items.provider_track_id = current_items.provider_track_id
-          WHERE current_items.backup_run_id = $2
-            AND previous_items.provider_track_id IS NULL
+          FROM (
+            SELECT provider_track_id, MIN(provider_added_at) AS provider_added_at
+            FROM backup_run_items
+            WHERE backup_run_id = $2
+            GROUP BY provider_track_id
+          ) current_items
+          LEFT JOIN (
+            SELECT DISTINCT provider_track_id
+            FROM backup_run_items
+            WHERE backup_run_id = $3
+          ) previous_items
+            ON previous_items.provider_track_id = current_items.provider_track_id
+          WHERE previous_items.provider_track_id IS NULL
           ON CONFLICT DO NOTHING
           RETURNING id
         `
@@ -935,15 +1114,18 @@ export async function recordLibraryEventsForRun(backupRunId, librarySourceId) {
             provider_event_at,
             backup_run_id
           )
-          SELECT $1, provider_track_id, 'added', NOW(), provider_added_at, $2
+          SELECT $1, provider_track_id, 'added', $3, MIN(provider_added_at), $2
           FROM backup_run_items
           WHERE backup_run_id = $2
+          GROUP BY provider_track_id
           ON CONFLICT DO NOTHING
           RETURNING id
         `;
     const addedResult = await client.query(
       addedQuery,
-      previousRunId ? [librarySourceId, backupRunId, previousRunId] : [librarySourceId, backupRunId],
+      previousRunId
+        ? [librarySourceId, backupRunId, previousRunId, observedAt]
+        : [librarySourceId, backupRunId, observedAt],
     );
 
     let removedCount = 0;
@@ -958,17 +1140,23 @@ export async function recordLibraryEventsForRun(backupRunId, librarySourceId) {
             provider_event_at,
             backup_run_id
           )
-          SELECT $1, previous_items.provider_track_id, 'removed', NOW(), NULL, $2
-          FROM backup_run_items previous_items
-          LEFT JOIN backup_run_items current_items
-            ON current_items.backup_run_id = $2
-           AND current_items.provider_track_id = previous_items.provider_track_id
-          WHERE previous_items.backup_run_id = $3
-            AND current_items.provider_track_id IS NULL
+          SELECT $1, previous_items.provider_track_id, 'removed', $4, NULL, $2
+          FROM (
+            SELECT DISTINCT provider_track_id
+            FROM backup_run_items
+            WHERE backup_run_id = $3
+          ) previous_items
+          LEFT JOIN (
+            SELECT DISTINCT provider_track_id
+            FROM backup_run_items
+            WHERE backup_run_id = $2
+          ) current_items
+            ON current_items.provider_track_id = previous_items.provider_track_id
+          WHERE current_items.provider_track_id IS NULL
           ON CONFLICT DO NOTHING
           RETURNING id
         `,
-        [librarySourceId, backupRunId, previousRunId],
+        [librarySourceId, backupRunId, previousRunId, observedAt],
       );
       removedCount = removedResult.rowCount;
     }
@@ -987,155 +1175,325 @@ export async function recordLibraryEventsForRun(backupRunId, librarySourceId) {
   }
 }
 
-export async function listTracks(userId) {
+export async function rebuildLibraryEventsForSource(librarySourceId) {
+  const client = await getPool().connect();
+
+  try {
+    await client.query("BEGIN");
+    await client.query("DELETE FROM library_events WHERE library_source_id = $1", [librarySourceId]);
+
+    const runs = await client.query(
+      `
+        SELECT id, COALESCE(finished_at, started_at) AS observed_at
+        FROM backup_runs
+        WHERE library_source_id = $1 AND status = 'succeeded'
+        ORDER BY COALESCE(finished_at, started_at) ASC, id ASC
+      `,
+      [librarySourceId],
+    );
+
+    let previousRunId = null;
+    let added = 0;
+    let removed = 0;
+
+    for (const run of runs.rows) {
+      const backupRunId = Number(run.id);
+      const observedAt = run.observed_at || new Date();
+
+      if (previousRunId) {
+        const addedResult = await client.query(
+          `
+            INSERT INTO library_events (
+              library_source_id,
+              provider_track_id,
+              event_type,
+              observed_at,
+              provider_event_at,
+              backup_run_id
+            )
+            SELECT $1, current_items.provider_track_id, 'added', $4,
+                   current_items.provider_added_at, $2
+            FROM (
+              SELECT provider_track_id, MIN(provider_added_at) AS provider_added_at
+              FROM backup_run_items
+              WHERE backup_run_id = $2
+              GROUP BY provider_track_id
+            ) current_items
+            LEFT JOIN (
+              SELECT DISTINCT provider_track_id
+              FROM backup_run_items
+              WHERE backup_run_id = $3
+            ) previous_items
+              ON previous_items.provider_track_id = current_items.provider_track_id
+            WHERE previous_items.provider_track_id IS NULL
+            ON CONFLICT DO NOTHING
+            RETURNING id
+          `,
+          [librarySourceId, backupRunId, previousRunId, observedAt],
+        );
+        added += addedResult.rowCount;
+
+        const removedResult = await client.query(
+          `
+            INSERT INTO library_events (
+              library_source_id,
+              provider_track_id,
+              event_type,
+              observed_at,
+              provider_event_at,
+              backup_run_id
+            )
+            SELECT $1, previous_items.provider_track_id, 'removed', $4, NULL, $2
+            FROM (
+              SELECT DISTINCT provider_track_id
+              FROM backup_run_items
+              WHERE backup_run_id = $3
+            ) previous_items
+            LEFT JOIN (
+              SELECT DISTINCT provider_track_id
+              FROM backup_run_items
+              WHERE backup_run_id = $2
+            ) current_items
+              ON current_items.provider_track_id = previous_items.provider_track_id
+            WHERE current_items.provider_track_id IS NULL
+            ON CONFLICT DO NOTHING
+            RETURNING id
+          `,
+          [librarySourceId, backupRunId, previousRunId, observedAt],
+        );
+        removed += removedResult.rowCount;
+      } else {
+        const addedResult = await client.query(
+          `
+            INSERT INTO library_events (
+              library_source_id,
+              provider_track_id,
+              event_type,
+              observed_at,
+              provider_event_at,
+              backup_run_id
+            )
+            SELECT $1, provider_track_id, 'added', $3, MIN(provider_added_at), $2
+            FROM backup_run_items
+            WHERE backup_run_id = $2
+            GROUP BY provider_track_id
+            ON CONFLICT DO NOTHING
+            RETURNING id
+          `,
+          [librarySourceId, backupRunId, observedAt],
+        );
+        added += addedResult.rowCount;
+      }
+
+      previousRunId = backupRunId;
+    }
+
+    await client.query("COMMIT");
+    return {
+      runs: runs.rowCount,
+      added,
+      removed,
+    };
+  } catch (error) {
+    await client.query("ROLLBACK");
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
+export async function listTracks(userId, librarySourceId = null) {
+  const source = await getLibrarySourceForUser(userId, librarySourceId);
+  if (!source) return [];
+
   const result = await getPool().query(
     `
       WITH latest_run AS (
         SELECT id
         FROM backup_runs
         WHERE
-          user_id = $1
-          AND provider = 'spotify'
-          AND source_type = 'liked_songs'
+          library_source_id = $2
           AND status = 'succeeded'
         ORDER BY finished_at DESC NULLS LAST, started_at DESC, id DESC
         LIMIT 1
       ),
       current_items AS (
-        SELECT provider_track_id
+        SELECT
+          provider_track_id,
+          MIN(provider_added_at) AS provider_added_at,
+          MIN(position)::int AS position
         FROM backup_run_items
         WHERE backup_run_id = (SELECT id FROM latest_run)
+        GROUP BY provider_track_id
+      ),
+      source_items AS (
+        SELECT
+          backup_run_items.provider_track_id,
+          MIN(backup_run_items.provider_added_at) AS first_provider_added_at,
+          MIN(backup_runs.finished_at) AS first_backed_up_at,
+          MAX(backup_runs.finished_at) AS last_seen_at
+        FROM backup_run_items
+        INNER JOIN backup_runs
+          ON backup_runs.id = backup_run_items.backup_run_id
+        WHERE
+          backup_runs.user_id = $1
+          AND backup_runs.library_source_id = $2
+          AND backup_runs.status = 'succeeded'
+        GROUP BY backup_run_items.provider_track_id
       ),
       event_stats AS (
         SELECT
-          library_events.provider_track_id,
-          COUNT(*) FILTER (WHERE event_type = 'added')::int AS favorite_add_count,
-          COUNT(*) FILTER (WHERE event_type = 'removed')::int AS favorite_remove_count,
-          MIN(observed_at) FILTER (WHERE event_type = 'added') AS first_favorited_observed_at,
-          MAX(observed_at) FILTER (WHERE event_type = 'added') AS last_favorited_observed_at,
+          provider_track_id,
+          COUNT(*) FILTER (WHERE event_type = 'added')::int AS add_count,
+          COUNT(*) FILTER (WHERE event_type = 'removed')::int AS remove_count,
+          MIN(observed_at) FILTER (WHERE event_type = 'added') AS first_added_observed_at,
+          MAX(observed_at) FILTER (WHERE event_type = 'added') AS last_added_observed_at,
           MAX(observed_at) FILTER (WHERE event_type = 'removed') AS last_removed_observed_at
         FROM library_events
-        INNER JOIN backup_runs
-          ON backup_runs.id = library_events.backup_run_id
-        WHERE
-          backup_runs.user_id = $1
-          AND backup_runs.provider = 'spotify'
-          AND backup_runs.source_type = 'liked_songs'
-        GROUP BY library_events.provider_track_id
+        WHERE library_source_id = $2
+        GROUP BY provider_track_id
       ),
       event_history AS (
         SELECT
-          library_events.provider_track_id,
+          provider_track_id,
           jsonb_agg(
             jsonb_build_object(
-              'id', library_events.id,
-              'type', library_events.event_type,
-              'observedAt', library_events.observed_at,
-              'providerEventAt', library_events.provider_event_at
+              'id', id,
+              'type', event_type,
+              'observedAt', observed_at,
+              'providerEventAt', provider_event_at
             )
-            ORDER BY library_events.observed_at, library_events.id
-          ) AS favorite_events
+            ORDER BY observed_at, id
+          ) AS source_events
         FROM library_events
-        INNER JOIN backup_runs
-          ON backup_runs.id = library_events.backup_run_id
-        WHERE
-          backup_runs.user_id = $1
-          AND backup_runs.provider = 'spotify'
-          AND backup_runs.source_type = 'liked_songs'
-        GROUP BY library_events.provider_track_id
+        WHERE library_source_id = $2
+        GROUP BY provider_track_id
       )
       SELECT
-        tracks.spotify_track_id,
-        tracks.name,
-        tracks.artists,
-        tracks.album_name,
-        tracks.duration_ms,
-        tracks.popularity,
-        tracks.explicit,
-        tracks.preview_url,
-        tracks.external_url,
-        tracks.spotify_uri,
-        tracks.image_url,
-        tracks.isrc,
-        tracks.spotify_added_at,
-        tracks.first_backed_up_at,
-        tracks.last_seen_at,
-        provider_tracks.provider,
         provider_tracks.id AS provider_track_db_id,
+        provider_tracks.provider,
+        provider_tracks.external_track_id,
+        provider_tracks.title,
+        provider_tracks.artist_names,
+        provider_tracks.album_name,
+        provider_tracks.duration_ms,
+        provider_tracks.popularity,
+        provider_tracks.explicit,
+        provider_tracks.preview_url,
+        provider_tracks.external_url,
+        provider_tracks.provider_uri,
+        provider_tracks.image_url,
+        provider_tracks.isrc,
         provider_tracks.canonical_track_id,
-        COALESCE(event_stats.favorite_add_count, 0) AS favorite_add_count,
-        COALESCE(event_stats.favorite_remove_count, 0) AS favorite_remove_count,
-        event_stats.first_favorited_observed_at,
-        event_stats.last_favorited_observed_at,
+        COALESCE(current_items.provider_added_at, source_items.first_provider_added_at) AS provider_added_at,
+        current_items.position,
+        source_items.first_backed_up_at,
+        source_items.last_seen_at,
+        COALESCE(event_stats.add_count, 0) AS add_count,
+        COALESCE(event_stats.remove_count, 0) AS remove_count,
+        event_stats.first_added_observed_at,
+        event_stats.last_added_observed_at,
         event_stats.last_removed_observed_at,
-        COALESCE(event_history.favorite_events, '[]'::jsonb) AS favorite_events,
+        COALESCE(event_history.source_events, '[]'::jsonb) AS source_events,
         CASE
           WHEN (SELECT id FROM latest_run) IS NULL THEN TRUE
           ELSE current_items.provider_track_id IS NOT NULL
         END AS is_currently_saved
-      FROM tracks
-      LEFT JOIN provider_tracks
-        ON provider_tracks.provider = 'spotify'
-       AND provider_tracks.external_track_id = tracks.spotify_track_id
+      FROM source_items
+      INNER JOIN provider_tracks
+        ON provider_tracks.id = source_items.provider_track_id
       LEFT JOIN current_items
         ON current_items.provider_track_id = provider_tracks.id
       LEFT JOIN event_stats
         ON event_stats.provider_track_id = provider_tracks.id
       LEFT JOIN event_history
         ON event_history.provider_track_id = provider_tracks.id
-      WHERE tracks.user_id = $1
-      ORDER BY is_currently_saved DESC, tracks.spotify_added_at DESC NULLS LAST, tracks.name ASC
+      ORDER BY
+        is_currently_saved DESC,
+        current_items.position ASC NULLS LAST,
+        provider_added_at DESC NULLS LAST,
+        provider_tracks.title ASC
       LIMIT 2000
     `,
-    [userId],
+    [userId, source.librarySourceId],
   );
 
   return result.rows.map((row) => ({
-    spotifyTrackId: row.spotify_track_id,
-    name: row.name,
-    artists: row.artists,
+    id: String(row.provider_track_db_id),
+    providerTrackId: String(row.provider_track_db_id),
+    providerTrackDbId: Number(row.provider_track_db_id),
+    canonicalTrackId: row.canonical_track_id ? Number(row.canonical_track_id) : null,
+    provider: row.provider || spotifyProvider,
+    externalTrackId: row.external_track_id,
+    name: row.title,
+    artists: row.artist_names,
     album: row.album_name,
     durationMs: row.duration_ms,
     popularity: row.popularity,
     explicit: row.explicit,
     previewUrl: row.preview_url,
     externalUrl: row.external_url,
-    spotifyUri: row.spotify_uri,
+    providerUri: row.provider_uri,
     imageUrl: row.image_url,
     isrc: row.isrc,
-    spotifyAddedAt: row.spotify_added_at,
+    providerAddedAt: row.provider_added_at,
+    position: row.position,
     firstBackedUpAt: row.first_backed_up_at,
     lastSeenAt: row.last_seen_at,
-    provider: row.provider || spotifyProvider,
-    providerTrackDbId: row.provider_track_db_id ? Number(row.provider_track_db_id) : null,
-    canonicalTrackId: row.canonical_track_id ? Number(row.canonical_track_id) : null,
-    favoriteAddCount: Math.max(Number(row.favorite_add_count || 0), 1),
-    favoriteRemoveCount: Number(row.favorite_remove_count || 0),
-    firstFavoritedObservedAt: row.first_favorited_observed_at,
-    lastFavoritedObservedAt: row.last_favorited_observed_at,
+    sourceAddCount: Math.max(Number(row.add_count || 0), 1),
+    sourceRemoveCount: Number(row.remove_count || 0),
+    firstAddedObservedAt: row.first_added_observed_at,
+    lastAddedObservedAt: row.last_added_observed_at,
     lastRemovedObservedAt: row.last_removed_observed_at,
-    favoriteEvents: row.favorite_events || [],
+    sourceEvents: row.source_events || [],
     isCurrentlySaved: row.is_currently_saved,
   }));
 }
 
-export async function getLibrarySummary(userId) {
+export async function getLibrarySummary(userId, librarySourceId = null) {
+  const source = await getLibrarySourceForUser(userId, librarySourceId);
+  if (!source) {
+    return {
+      total: 0,
+      currentTotal: 0,
+      totalKnown: 0,
+      rediscoveredTracks: 0,
+      removedTracks: 0,
+      lifecycleEvents: 0,
+      lastBackupAt: null,
+      lastBackupStatus: null,
+      lastBackupTracksSeen: 0,
+      lastBackupError: null,
+      selectedSource: null,
+    };
+  }
+
   const [
     { rows: countRows },
     { rows: currentRows },
     { rows: runRows },
     { rows: eventRows },
   ] = await Promise.all([
-    getPool().query("SELECT COUNT(*)::int AS count FROM tracks WHERE user_id = $1", [userId]),
+    getPool().query(
+      `
+        SELECT COUNT(DISTINCT backup_run_items.provider_track_id)::int AS count
+        FROM backup_run_items
+        INNER JOIN backup_runs
+          ON backup_runs.id = backup_run_items.backup_run_id
+        WHERE
+          backup_runs.user_id = $1
+          AND backup_runs.library_source_id = $2
+          AND backup_runs.status = 'succeeded'
+      `,
+      [userId, source.librarySourceId],
+    ),
     getPool().query(
       `
         WITH latest_run AS (
           SELECT id
           FROM backup_runs
           WHERE
-            user_id = $1
-            AND provider = 'spotify'
-            AND source_type = 'liked_songs'
+            library_source_id = $1
             AND status = 'succeeded'
           ORDER BY finished_at DESC NULLS LAST, started_at DESC, id DESC
           LIMIT 1
@@ -1143,35 +1501,33 @@ export async function getLibrarySummary(userId) {
         SELECT
           (SELECT id FROM latest_run) AS run_id,
           (
-            SELECT COUNT(*)::int
+            SELECT COUNT(DISTINCT provider_track_id)::int
             FROM backup_run_items
             WHERE backup_run_id = (SELECT id FROM latest_run)
           ) AS count
       `,
-      [userId],
+      [source.librarySourceId],
     ),
     getPool().query(
       `
         SELECT finished_at, tracks_seen, status, error_message
         FROM backup_runs
-        WHERE user_id = $1
-        ORDER BY started_at DESC
+        WHERE library_source_id = $1
+        ORDER BY started_at DESC, id DESC
         LIMIT 1
       `,
-      [userId],
+      [source.librarySourceId],
     ),
     getPool().query(
       `
         WITH stats AS (
           SELECT
-            library_events.provider_track_id,
+            provider_track_id,
             COUNT(*) FILTER (WHERE event_type = 'added')::int AS add_count,
             COUNT(*) FILTER (WHERE event_type = 'removed')::int AS remove_count
           FROM library_events
-          INNER JOIN backup_runs
-            ON backup_runs.id = library_events.backup_run_id
-          WHERE backup_runs.user_id = $1
-          GROUP BY library_events.provider_track_id
+          WHERE library_source_id = $1
+          GROUP BY provider_track_id
         )
         SELECT
           COUNT(*) FILTER (WHERE add_count > 1)::int AS rediscovered_tracks,
@@ -1179,7 +1535,7 @@ export async function getLibrarySummary(userId) {
           COALESCE(SUM(add_count + remove_count), 0)::int AS lifecycle_events
         FROM stats
       `,
-      [userId],
+      [source.librarySourceId],
     ),
   ]);
 
@@ -1198,5 +1554,12 @@ export async function getLibrarySummary(userId) {
     lastBackupStatus: runRows[0]?.status || null,
     lastBackupTracksSeen: runRows[0]?.tracks_seen || 0,
     lastBackupError: runRows[0]?.error_message || null,
+    selectedSource: {
+      id: source.librarySourceId,
+      provider: source.provider,
+      sourceType: source.sourceType,
+      providerSourceId: source.providerSourceId,
+      name: source.name,
+    },
   };
 }

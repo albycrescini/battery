@@ -1,18 +1,22 @@
 # Music Backup
 
-Local MVP for backing up a Spotify user's liked songs into Postgres and viewing
-favorite lifecycle history in a Next.js web UI.
+Local MVP for backing up music collections into Postgres and viewing source
+membership history in a Next.js web UI. Spotify is the first implemented
+provider, with support for Favorites and playlists.
 
 ## What Works
 
 - Spotify OAuth login using the Authorization Code flow.
-- `user-library-read` access for the current user's saved tracks.
-- On-demand backup of liked songs from `GET /v1/me/tracks`.
+- `user-library-read`, `playlist-read-private`, and
+  `playlist-read-collaborative` access for the current user's Spotify sources.
+- Source discovery for Spotify Favorites and current-user playlists.
+- On-demand backup of a selected source from `GET /v1/me/tracks` or
+  `GET /v1/playlists/{playlist_id}/tracks`.
 - Postgres persistence for users, provider accounts, encrypted Spotify tokens,
   provider-neutral track identity, backup snapshots, and lifecycle events.
 - A modern Next.js dashboard for connection status, sync status, track count,
-  last backup, lifecycle timelines, search, album, artist, and saved-at
-  metadata.
+  source selection, last backup, lifecycle timelines, search, album, artist, and
+  source-added metadata.
 
 Scheduled backups and export/import to other platforms are intentionally left for
 the next iteration.
@@ -23,8 +27,8 @@ The storage layer is now designed around provider-agnostic snapshots:
 
 - `provider_accounts` stores credentials and profile metadata per connected
   platform.
-- `library_sources` identifies the backed-up collection, such as liked songs or
-  a playlist, under a provider account.
+- `library_sources` identifies the backed-up collection, such as Favorites or a
+  playlist, under a provider account.
 - `canonical_tracks` stores cross-provider song identity. ISRC is preferred, with
   normalized metadata as a fallback match key.
 - `provider_tracks` stores provider-specific IDs, URLs, artwork, and raw
@@ -34,8 +38,8 @@ The storage layer is now designed around provider-agnostic snapshots:
 - `library_events` stores derived `added` and `removed` observations by diffing a
   successful run against the previous successful run for the same source.
 
-That model supports the lifecycle UI: stable favorites have one add event,
-removed songs have remove events, and rediscovered songs have multiple add
+That model supports the lifecycle UI: stable source membership has one add
+event, removed songs have remove events, and re-added songs have multiple add
 events. It also creates the base for future transfer workflows because Spotify,
 Apple Music, YouTube Music, or other provider IDs can map to the same canonical
 track.

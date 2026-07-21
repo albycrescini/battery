@@ -7,6 +7,7 @@ import {
   Database,
   Heart,
   History,
+  ListMusic,
   LogIn,
   LogOut,
   Music,
@@ -73,14 +74,14 @@ function eventTime(event) {
 }
 
 function lifecycleEvents(track, summary) {
-  const events = Array.isArray(track.favoriteEvents)
-    ? track.favoriteEvents
+  const events = Array.isArray(track.sourceEvents)
+    ? track.sourceEvents
         .filter((event) => event && (event.type === "added" || event.type === "removed"))
         .map((event) => ({ ...event }))
     : [];
   const fallbackAddedAt =
-    track.spotifyAddedAt ||
-    track.firstFavoritedObservedAt ||
+    track.providerAddedAt ||
+    track.firstAddedObservedAt ||
     track.firstBackedUpAt ||
     track.lastSeenAt ||
     summary.lastBackupAt ||
@@ -90,7 +91,7 @@ function lifecycleEvents(track, summary) {
     events.unshift({
       type: "added",
       observedAt: fallbackAddedAt,
-      providerEventAt: track.spotifyAddedAt || fallbackAddedAt,
+      providerEventAt: track.providerAddedAt || fallbackAddedAt,
     });
   }
 
@@ -108,9 +109,9 @@ function lifecycleEvents(track, summary) {
 }
 
 function lifecycleLabel(track) {
-  const addCount = Math.max(Number(track.favoriteAddCount || 0), 1);
-  const removeCount = Number(track.favoriteRemoveCount || 0);
-  if (addCount > 1) return `Rediscovered ${addCount - 1}x`;
+  const addCount = Math.max(Number(track.sourceAddCount || 0), 1);
+  const removeCount = Number(track.sourceRemoveCount || 0);
+  if (addCount > 1) return `Re-added ${addCount - 1}x`;
   if (removeCount > 0) return "Removed once";
   return "Stable";
 }
@@ -256,13 +257,13 @@ function computeAwayDays(events, untilValue) {
 }
 
 function eventLabel(event, index) {
-  if (event.type === "removed") return "Removed by";
+  if (event.type === "removed") return "Removed";
   return index === 0 ? "Added" : "Re-added";
 }
 
 function statusPill(track) {
   return track.isCurrentlySaved ? (
-    <span className="statusPill active">Current</span>
+    <span className="statusPill active">Present</span>
   ) : (
     <span className="statusPill removed">Removed</span>
   );
@@ -293,8 +294,8 @@ function DetailPanel({ track, summary, onClose }) {
   if (!track) return null;
 
   const events = lifecycleEvents(track, summary);
-  const addCount = Math.max(Number(track.favoriteAddCount || 0), 1);
-  const removeCount = Number(track.favoriteRemoveCount || 0);
+  const addCount = Math.max(Number(track.sourceAddCount || 0), 1);
+  const removeCount = Number(track.sourceRemoveCount || 0);
   const lastAdded = [...events].reverse().find((event) => event.type === "added");
   const lastChange = events[events.length - 1];
   const lastBackupAt = summary.lastBackupAt || new Date().toISOString();
@@ -334,7 +335,7 @@ function DetailPanel({ track, summary, onClose }) {
 
       <dl className="detailStats">
         <div>
-          <dt>Favorite periods</dt>
+          <dt>Membership periods</dt>
           <dd>{addCount}</dd>
         </div>
         <div>
@@ -342,11 +343,11 @@ function DetailPanel({ track, summary, onClose }) {
           <dd>{removeCount}</dd>
         </div>
         <div>
-          <dt>Current streak</dt>
+          <dt>Current stretch</dt>
           <dd>{currentStreak}</dd>
         </div>
         <div>
-          <dt>Time away</dt>
+          <dt>Time absent</dt>
           <dd>{awayDays ? pluralize(awayDays, "day") : "None"}</dd>
         </div>
         <div>
@@ -375,8 +376,27 @@ function getUrlError() {
   return messages[error] || error;
 }
 
+function sourceTypeLabel(source) {
+  if (!source) return "Source";
+  if (source.sourceType === "liked_songs") return "Favorites";
+  if (source.sourceType === "playlist") return "Playlist";
+  return source.sourceType.replaceAll("_", " ");
+}
+
+function sourceIcon(source) {
+  return source?.sourceType === "playlist" ? ListMusic : Heart;
+}
+
+function sourceAddedColumnLabel(source) {
+  if (source?.sourceType === "liked_songs") return "Saved on provider";
+  if (source?.sourceType === "playlist") return "Added to playlist";
+  return "Added to source";
+}
+
 export default function HomePage() {
   const [session, setSession] = useState(null);
+  const [sources, setSources] = useState([]);
+  const [selectedSourceId, setSelectedSourceId] = useState(null);
   const [tracks, setTracks] = useState([]);
   const [summary, setSummary] = useState(emptySummary);
   const [query, setQuery] = useState("");
@@ -394,13 +414,17 @@ export default function HomePage() {
   }, [query, tracks]);
 
   const selectedTrack = useMemo(
-    () => tracks.find((track) => track.spotifyTrackId === selectedTrackId) || null,
+    () => tracks.find((track) => track.id === selectedTrackId) || null,
     [selectedTrackId, tracks],
   );
 
   const currentTotal = summary.currentTotal ?? summary.total ?? 0;
   const knownTotal = summary.totalKnown ?? currentTotal;
   const authenticated = Boolean(session?.authenticated);
+  const currentSource = useMemo(
+    () => sources.find((source) => source.id === selectedSourceId) || summary.selectedSource || null,
+    [selectedSourceId, sources, summary.selectedSource],
+  );
   const connectionLabel = authenticated
     ? session.user?.displayName || session.user?.spotifyUserId
     : "Not connected";
@@ -410,28 +434,54 @@ export default function HomePage() {
     setTracks(nextTracks);
     setSummary({ ...emptySummary, ...library });
     setSelectedTrackId((current) => {
-      if (nextTracks.some((track) => track.spotifyTrackId === current)) return current;
+      if (nextTracks.some((track) => track.id === current)) return current;
       const fallback =
-        nextTracks.find((track) => Number(track.favoriteAddCount || 0) > 1) ||
-        nextTracks.find((track) => Number(track.favoriteRemoveCount || 0) > 0) ||
+        nextTracks.find((track) => Number(track.sourceAddCount || 0) > 1) ||
+        nextTracks.find((track) => Number(track.sourceRemoveCount || 0) > 0) ||
         nextTracks[0];
-      return fallback?.spotifyTrackId || null;
+      return fallback?.id || null;
     });
+  }
+
+  async function fetchLibraryForSource(sourceId) {
+    const suffix = sourceId ? `?sourceId=${encodeURIComponent(sourceId)}` : "";
+    const response = await fetch(`/api/tracks${suffix}`);
+    const library = await response.json();
+    if (!response.ok) throw new Error(library.error || "Could not load source history");
+    return library;
+  }
+
+  async function loadLibraryForSource(sourceId) {
+    const library = await fetchLibraryForSource(sourceId);
+    setDashboardPayload(library);
+    setSelectedSourceId(library.selectedSource?.id || sourceId || null);
+    return library;
   }
 
   useEffect(() => {
     let cancelled = false;
 
     async function loadDashboard() {
-      const [sessionResponse, trackResponse] = await Promise.all([
-        fetch("/api/session"),
-        fetch("/api/tracks"),
-      ]);
+      const sessionResponse = await fetch("/api/session");
       const nextSession = await sessionResponse.json();
-      const library = await trackResponse.json();
+      let nextSources = [];
+      let discoveryError = null;
+
+      if (nextSession.authenticated) {
+        const sourceResponse = await fetch("/api/library-sources");
+        const sourcePayload = await sourceResponse.json();
+        if (!sourceResponse.ok) throw new Error(sourcePayload.error || "Could not load sources");
+        nextSources = sourcePayload.sources || [];
+        discoveryError = sourcePayload.discoveryError || null;
+      }
+
+      const initialSourceId = nextSources[0]?.id || null;
+      const library = await fetchLibraryForSource(initialSourceId);
       if (cancelled) return;
 
       setSession(nextSession);
+      setSources(nextSources);
+      setSelectedSourceId(library.selectedSource?.id || initialSourceId);
       setDashboardPayload(library);
 
       const setupMessage = !nextSession.databaseReady
@@ -443,6 +493,7 @@ export default function HomePage() {
       const message =
         urlError ||
         setupMessage ||
+        (discoveryError ? `Source discovery failed: ${discoveryError}. Reconnect Spotify if playlist access was added recently.` : "") ||
         (library.lastBackupError ? `Last backup failed: ${library.lastBackupError}` : "");
       setNotice(message);
       setNoticeVariant(message ? "error" : "info");
@@ -460,16 +511,36 @@ export default function HomePage() {
     };
   }, []);
 
-  async function syncLikedSongs() {
+  async function selectSource(sourceId) {
+    setSelectedSourceId(sourceId);
+    setSelectedTrackId(null);
+    setQuery("");
+    setNotice("");
+
+    try {
+      await loadLibraryForSource(sourceId);
+    } catch (error) {
+      setNotice(error.message);
+      setNoticeVariant("error");
+    }
+  }
+
+  async function backupSelectedSource() {
+    if (!selectedSourceId) return;
+
     setSyncing(true);
-    setNotice("Reading liked songs from Spotify and saving them locally.");
+    setNotice(`Reading ${currentSource?.name || "selected source"} and saving it locally.`);
     setNoticeVariant("info");
 
     try {
-      const response = await fetch("/api/backup/liked-songs", { method: "POST" });
+      const response = await fetch(`/api/backup/source?sourceId=${encodeURIComponent(selectedSourceId)}`, {
+        method: "POST",
+      });
       const payload = await response.json();
       if (!response.ok) throw new Error(payload.error || "Backup failed");
 
+      if (payload.sources) setSources(payload.sources);
+      setSelectedSourceId(payload.selectedSource?.id || selectedSourceId);
       setDashboardPayload(payload);
       setNotice("");
     } catch (error) {
@@ -522,7 +593,7 @@ export default function HomePage() {
       <section className="heroBand">
         <div>
           <p className="eyebrow">Library timeline</p>
-          <h1>Favorite history, ready for every provider.</h1>
+          <h1>Favorites and playlists, ready for every provider.</h1>
         </div>
         <div className="heroStatus">
           <span>Last backup</span>
@@ -535,18 +606,50 @@ export default function HomePage() {
           <button
             className="button primaryButton"
             type="button"
-            onClick={syncLikedSongs}
-            disabled={!authenticated || syncing}
+            onClick={backupSelectedSource}
+            disabled={!authenticated || !selectedSourceId || syncing}
           >
             <RefreshCw className={syncing ? "spin" : ""} size={18} aria-hidden="true" />
-            <span>{syncing ? "Backing up" : "Back up liked songs"}</span>
+            <span>{syncing ? "Backing up" : "Back up selected source"}</span>
           </button>
+
+          <div className="sourcePicker" aria-label="History source">
+            <div className="sourcePickerHeader">
+              <span>History source</span>
+              <strong>{sources.length}</strong>
+            </div>
+            {sources.length ? (
+              sources.map((source) => {
+                const Icon = sourceIcon(source);
+                const selected = source.id === selectedSourceId;
+                return (
+                  <button
+                    key={source.id}
+                    className={`sourceOption${selected ? " selected" : ""}`}
+                    type="button"
+                    onClick={() => selectSource(source.id)}
+                    aria-pressed={selected}
+                  >
+                    <Icon size={17} aria-hidden="true" />
+                    <span>
+                      <b>{source.name}</b>
+                      <small>
+                        {sourceTypeLabel(source)} - {source.provider}
+                      </small>
+                    </span>
+                  </button>
+                );
+              })
+            ) : (
+              <p className="sourceEmpty">Connect Spotify to discover favorites and playlists.</p>
+            )}
+          </div>
 
           {notice ? <p className={`notice ${noticeVariant}`}>{notice}</p> : null}
 
           <div className="metricStack">
-            <Metric icon={Heart} label="Current tracks" value={currentTotal} tone="green" />
-            <Metric icon={Database} label="Known over time" value={knownTotal} />
+            <Metric icon={Heart} label="Current in source" value={currentTotal} tone="green" />
+            <Metric icon={Database} label="Known in source" value={knownTotal} />
             <Metric icon={Activity} label="Lifecycle events" value={summary.lifecycleEvents || 0} />
             <Metric icon={Clock} label="Last backup" value={formatDate(summary.lastBackupAt)} />
           </div>
@@ -556,7 +659,12 @@ export default function HomePage() {
           <div className="libraryHeader">
             <div>
               <p className="sectionLabel">Song history</p>
-              <h2>Favorite lifecycle</h2>
+              <h2>{currentSource?.name || "Source lifecycle"}</h2>
+              <span className="sourceMeta">
+                {currentSource
+                  ? `${sourceTypeLabel(currentSource)} - ${currentSource.provider}`
+                  : "No source selected"}
+              </span>
             </div>
             <label className="searchBox">
               <Search size={17} aria-hidden="true" />
@@ -570,9 +678,9 @@ export default function HomePage() {
           </div>
 
           <div className="insightStrip" aria-live="polite">
-            <Metric icon={RotateCcw} label="Rediscovered" value={summary.rediscoveredTracks || 0} />
+            <Metric icon={RotateCcw} label="Re-added" value={summary.rediscoveredTracks || 0} />
             <Metric icon={History} label="Removed" value={summary.removedTracks || 0} tone="amber" />
-            <Metric icon={Heart} label="Currently saved" value={currentTotal} tone="green" />
+            <Metric icon={Heart} label="Currently present" value={currentTotal} tone="green" />
           </div>
 
           <DetailPanel
@@ -588,7 +696,7 @@ export default function HomePage() {
                   <th>Song</th>
                   <th>Artist</th>
                   <th>Album</th>
-                  <th>Saved on Spotify</th>
+                  <th>{sourceAddedColumnLabel(currentSource)}</th>
                   <th>Status</th>
                   <th>Lifecycle</th>
                 </tr>
@@ -597,9 +705,9 @@ export default function HomePage() {
                 {filteredTracks.length ? (
                   filteredTracks.map((track) => (
                     <tr
-                      key={track.spotifyTrackId}
-                      className={track.spotifyTrackId === selectedTrackId ? "selected" : ""}
-                      onClick={() => setSelectedTrackId(track.spotifyTrackId)}
+                      key={track.id}
+                      className={track.id === selectedTrackId ? "selected" : ""}
+                      onClick={() => setSelectedTrackId(track.id)}
                     >
                       <td>
                         <div className="songCell">
@@ -624,7 +732,7 @@ export default function HomePage() {
                       </td>
                       <td>{track.artists}</td>
                       <td>{track.album || ""}</td>
-                      <td>{track.spotifyAddedAt ? formatDate(track.spotifyAddedAt) : ""}</td>
+                      <td>{track.providerAddedAt ? formatDate(track.providerAddedAt) : ""}</td>
                       <td>{statusPill(track)}</td>
                       <td>
                         <div className="lifecycle">
@@ -637,7 +745,9 @@ export default function HomePage() {
                 ) : (
                   <tr>
                     <td colSpan={6} className="empty">
-                      {tracks.length ? "No matching songs." : "No backup has been saved yet."}
+                      {tracks.length
+                        ? "No matching songs."
+                        : "No backup has been saved for this source yet."}
                     </td>
                   </tr>
                 )}

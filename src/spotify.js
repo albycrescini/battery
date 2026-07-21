@@ -4,7 +4,12 @@ import { config } from "./config.js";
 const authorizeUrl = "https://accounts.spotify.com/authorize";
 const tokenUrl = "https://accounts.spotify.com/api/token";
 const apiBaseUrl = "https://api.spotify.com/v1";
-const likedSongScopes = ["user-library-read", "user-read-email"];
+const musicBackupScopes = [
+  "user-library-read",
+  "user-read-email",
+  "playlist-read-private",
+  "playlist-read-collaborative",
+];
 
 function getBasicAuthHeader() {
   return `Basic ${Buffer.from(
@@ -20,7 +25,7 @@ export function createAuthorizationUrl(state) {
   const params = new URLSearchParams({
     response_type: "code",
     client_id: config.spotifyClientId,
-    scope: likedSongScopes.join(" "),
+    scope: musicBackupScopes.join(" "),
     redirect_uri: config.spotifyRedirectUri,
     state,
   });
@@ -67,6 +72,35 @@ export async function getCurrentSpotifyUser(accessToken) {
 
 export async function fetchSavedTracks(accessToken, onPage) {
   let nextUrl = `${apiBaseUrl}/me/tracks?limit=50`;
+  let totalSeen = 0;
+
+  while (nextUrl) {
+    const page = await spotifyGet(accessToken, nextUrl);
+    const items = page.items || [];
+    const pageStart = totalSeen;
+    totalSeen += items.length;
+    await onPage(items, page, pageStart);
+    nextUrl = page.next;
+  }
+
+  return totalSeen;
+}
+
+export async function fetchCurrentUserPlaylists(accessToken) {
+  let nextUrl = `${apiBaseUrl}/me/playlists?limit=50`;
+  const playlists = [];
+
+  while (nextUrl) {
+    const page = await spotifyGet(accessToken, nextUrl);
+    playlists.push(...(page.items || []).filter((playlist) => playlist?.id));
+    nextUrl = page.next;
+  }
+
+  return playlists;
+}
+
+export async function fetchPlaylistTracks(accessToken, playlistId, onPage) {
+  let nextUrl = `${apiBaseUrl}/playlists/${encodeURIComponent(playlistId)}/tracks?limit=100`;
   let totalSeen = 0;
 
   while (nextUrl) {

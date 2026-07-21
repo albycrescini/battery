@@ -3,8 +3,6 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 export const rootDir = dirname(fileURLToPath(new URL("../package.json", import.meta.url)));
-export const publicDir = join(rootDir, "public");
-
 function loadEnvFile() {
   const envPath = join(rootDir, ".env");
   if (!existsSync(envPath)) return;
@@ -45,9 +43,35 @@ export const config = {
   spotifyClientSecret: process.env.SPOTIFY_CLIENT_SECRET || "",
   spotifyRedirectUri:
     process.env.SPOTIFY_REDIRECT_URI || `http://127.0.0.1:${port}/auth/callback`,
+  amazonMusicClientId: process.env.AMAZON_MUSIC_CLIENT_ID || "",
+  amazonMusicClientSecret: process.env.AMAZON_MUSIC_CLIENT_SECRET || "",
+  amazonMusicSecurityProfileId: process.env.AMAZON_MUSIC_SECURITY_PROFILE_ID || "",
+  amazonMusicRedirectUri:
+    process.env.AMAZON_MUSIC_REDIRECT_URI ||
+    `http://127.0.0.1:${port}/auth/amazon-music/callback`,
+  amazonMusicAuthorizeUrl:
+    process.env.AMAZON_MUSIC_AUTHORIZE_URL || "https://www.amazon.com/ap/oa",
+  amazonMusicTokenUrl:
+    process.env.AMAZON_MUSIC_TOKEN_URL || "https://api.amazon.com/auth/o2/token",
+  amazonMusicApiBaseUrl:
+    process.env.AMAZON_MUSIC_API_BASE_URL || "https://api.music.amazon.dev",
+  amazonMusicScopes: (
+    process.env.AMAZON_MUSIC_SCOPES ||
+    "music::profile music::library music::catalog music::favorites"
+  )
+    .split(/\s+/)
+    .filter(Boolean),
   sessionSecret: process.env.SESSION_SECRET || "local-dev-session-secret-change-me",
 };
 
 export function spotifyIsConfigured() {
   return Boolean(config.spotifyClientId && config.spotifyClientSecret);
+}
+
+export function amazonMusicIsConfigured() {
+  return Boolean(
+    config.amazonMusicClientId &&
+      config.amazonMusicClientSecret &&
+      config.amazonMusicSecurityProfileId,
+  );
 }
