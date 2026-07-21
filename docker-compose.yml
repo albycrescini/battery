@@ -1,0 +1,20 @@
+services:
+  db:
+    image: postgres:16-alpine
+    container_name: spotify-backup-db
+    environment:
+      POSTGRES_DB: spotify_backup
+      POSTGRES_USER: spotify_backup
+      POSTGRES_PASSWORD: spotify_backup
+    ports:
+      - "5432:5432"
+    volumes:
+      - spotify_backup_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U spotify_backup -d spotify_backup"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+volumes:
+  spotify_backup_pgdata:

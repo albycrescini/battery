@@ -1,0 +1,110 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Music Backup</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <main class="shell">
+      <section class="panel intro">
+        <div>
+          <p class="eyebrow">Local MVP</p>
+          <h1>Music Backup</h1>
+          <p class="summary">
+            Back up saved songs into your own SQL database, track how your
+            library changes over time, and prepare it for future provider moves.
+          </p>
+        </div>
+        <div class="status" id="connectionStatus">Not connected</div>
+      </section>
+
+      <section class="workspace">
+        <aside class="sidebar">
+          <button class="primary" id="loginButton" type="button">Connect Spotify</button>
+          <button class="secondary" id="syncButton" type="button" disabled>Back up liked songs</button>
+          <button class="ghost" id="logoutButton" type="button" hidden>Disconnect</button>
+          <p class="notice" id="notice" hidden></p>
+          <dl>
+            <div>
+              <dt>Current tracks</dt>
+              <dd id="trackCount">0</dd>
+            </div>
+            <div>
+              <dt>Known over time</dt>
+              <dd id="knownTrackCount">0</dd>
+            </div>
+            <div>
+              <dt>Lifecycle events</dt>
+              <dd id="lifecycleEventCount">0</dd>
+            </div>
+            <div>
+              <dt>Last backup</dt>
+              <dd id="lastBackup">Never</dd>
+            </div>
+          </dl>
+        </aside>
+
+        <section class="library">
+          <div class="libraryHeader">
+            <div>
+              <h2>Song history</h2>
+              <p id="librarySubhead">Connect Spotify to create the first backup.</p>
+            </div>
+            <input id="searchInput" type="search" placeholder="Search songs or artists" />
+          </div>
+          <div class="insightStrip" aria-live="polite">
+            <div>
+              <b id="rediscoveredCount">0</b>
+              <span>Rediscovered</span>
+            </div>
+            <div>
+              <b id="removedTrackCount">0</b>
+              <span>Removed</span>
+            </div>
+            <div>
+              <b id="currentTrackCount">0</b>
+              <span>Currently saved</span>
+            </div>
+          </div>
+          <aside class="detailPanel" id="trackDetail" hidden>
+            <button class="detailClose" id="detailClose" type="button" aria-label="Close details">Close</button>
+            <div class="detailTopline">
+              <div class="detailSong">
+                <div id="detailCover" class="detailCover"></div>
+                <div>
+                  <h3 id="detailTitle">Song lifecycle</h3>
+                  <p id="detailMeta"></p>
+                </div>
+              </div>
+              <div id="detailStatus"></div>
+            </div>
+            <div id="detailTimeline" class="detailTimeline"></div>
+            <dl id="detailStats" class="detailStats"></dl>
+          </aside>
+          <div class="tableWrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>Song</th>
+                  <th>Artist</th>
+                  <th>Album</th>
+                  <th>Saved on Spotify</th>
+                  <th>Status</th>
+                  <th>Lifecycle</th>
+                </tr>
+              </thead>
+              <tbody id="trackTable">
+                <tr>
+                  <td colspan="6" class="empty">No backup has been saved yet.</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+        </section>
+      </section>
+    </main>
+    <script src="/app.js" type="module"></script>
+  </body>
+</html>
